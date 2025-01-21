@@ -30,6 +30,7 @@ from groq import Groq
 from huggingface_hub import HfApi
 from dotenv import load_dotenv
 import re
+from Backend.ImageGeneration import generate_images_and_open
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -174,41 +175,86 @@ def classify_query(query: str) -> str:
             
     return 'general'  # Default case
 
+def FirstLayerDMM(query: str) -> list:
+    """First layer decision making model"""
+    query = query.lower().strip()
+    
+    # Handle image generation
+    if query.startswith("generate"):
+        prompt = query.replace("generate", "", 1).strip()
+        return ["generate", prompt]
+        
+    # Handle realtime queries
+    if any(word in query for word in ["news", "weather", "latest", "current"]):
+        return ["realtime", query]
+        
+    # Handle command queries
+    if any(cmd in query for cmd in ["open", "close", "play", "system", "content", "google search", "youtube search"]):
+        return ["command", query]
+        
+    # Handle exit
+    if any(word in query for word in ["bye", "goodbye", "exit", "quit"]):
+        return ["exit"]
+        
+    # General queries
+    return ["general", query]
+
 def MainExecution():
     TaskExecution = False
-    ImageExecution = False
     
     SetAssistantStatus("Listening...")
     Query = SpeechRecognition()
     ShowTextToScreen(f"{Username} : {Query}")
     
-    query_type = classify_query(Query)
-    SetAssistantStatus("Thinking...")
+    # Get decision from Model
+    decision = FirstLayerDMM(Query)
+    if not decision:
+        return False
+        
+    decision_type = decision[0]
     
-    if query_type == 'realtime':
-        Answer = RealtimeSearchEngine(QueryModifier(Query))
+    # Handle decisions
+    if decision_type == "generate":
+        try:
+            prompt = decision[1]
+            SetAssistantStatus("Generating image...")
+            success = generate_images_and_open(prompt)
+            
+            if success:
+                SetAssistantStatus("Image generated successfully")
+                return True
+            else:
+                SetAssistantStatus("Image generation failed")
+                return False
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}")
+            return False
+            
+    elif decision_type == "realtime":
+        TaskExecution = True
+        Answer = RealtimeSearchEngine(QueryModifier(decision[1]))
         ShowTextToScreen(f"{Assistantname}:{Answer}")
         SetAssistantStatus("Answering...")
         TextToSpeech(Answer)
-        return True
         
-    elif query_type == 'command':
-        Decision = [Query]  # Direct command execution
-        run(Automation(Decision))
-        return True
+    elif decision_type == "command":
+        TaskExecution = True
+        run(Automation([decision[1]]))
         
-    elif query_type == 'exit':
+    elif decision_type == "exit":
         Answer = "Goodbye! Have a great day!"
         ShowTextToScreen(f"{Assistantname}:{Answer}")
         TextToSpeech(Answer)
         sys.exit(0)
         
-    else:  # general queries
-        Answer = ChatBot(QueryModifier(Query))
+    else:  # general
+        TaskExecution = True
+        Answer = ChatBot(QueryModifier(decision[1]))
         ShowTextToScreen(f"{Assistantname}:{Answer}")
         SetAssistantStatus("Answering...")
         TextToSpeech(Answer)
-        return True
+        
+    return TaskExecution
 
 def firstThread():
     while True:
@@ -243,4 +289,3 @@ if __name__ == "__main__":
         logger.info("Application terminated by user")
     except Exception as e:
         logger.error(f"Main thread error: {e}", exc_info=True)
-
