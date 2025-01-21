@@ -1,5 +1,3 @@
-
-
 import cohere  # Import cohere library for AI services
 from rich import print  # Import the rich library to enhance terminal outputs
 from dotenv import dotenv_values  # Import dotenv to load environmental variables from a .env file
@@ -47,13 +45,27 @@ You will decide whether a query is a 'general' query, a 'realtime' query, or is 
 """
 
 # Define the function for processing user queries
-def FirstLayerDMM(prompt: str):
+def FirstLayerDMM(query: str) -> list:
+    query = query.lower()
+    
+    # Check for generate commands
+    if query.startswith("generate"):
+        return ["generate"]  # Just return command type
+            
+    # Add image generation detection
+    if any(x in query for x in ["generate image", "create image", "make image"]):
+        return ["generate", "image", query]
+        
+    # Existing command detection
+    if any(x in query for x in ["search", "look up", "find"]):
+        return ["realtime"]
+
     # Pass the user's query to the Cohere chat endpoint
     try:
         response = co.generate(
             model="command-xlarge-nightly",
-            prompt=f"{preamble}\nUser: {prompt}\nDecision:",
-            max_tokens=64,
+            prompt=f"{preamble}\nUser: {query}\nDecision:",
+            max_tokens=128,
             temperature=0.7,
             stop_sequences=["\n"]
         )
@@ -63,13 +75,13 @@ def FirstLayerDMM(prompt: str):
         
         # Handle unexpected cases or empty responses
         if not decision:
-            return f"general ({prompt})"  # Default to general if response is empty or unclear
+            return [f"general ({query})"]  # Default to general if response is empty or unclear
 
         # Return the AI's decision
-        return decision
+        return [decision]
 
     except Exception as e:
-        return f"[bold red]Error:[/bold red] {e}"
+        return [f"[bold red]Error:[/bold red] {e}"]
 
 # Entry point for the script
 if __name__ == "__main__":
@@ -84,4 +96,3 @@ if __name__ == "__main__":
             break
         result = FirstLayerDMM(user_input)
         print(f"[bold blue]Decision:[/bold blue] {result}")
-        
