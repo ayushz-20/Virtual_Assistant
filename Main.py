@@ -175,29 +175,42 @@ def classify_query(query: str) -> str:
             
     return 'general'  # Default case
 
-def FirstLayerDMM(query: str) -> list:
-    """First layer decision making model"""
-    query = query.lower().strip()
+def split_complex_query(query: str) -> list:
+    """Split query with multiple commands"""
+    commands = []
+    parts = query.split(" and ")
     
-    # Handle image generation
-    if query.startswith("generate"):
-        prompt = query.replace("generate", "", 1).strip()
-        return ["generate", prompt]
-        
-    # Handle realtime queries
-    if any(word in query for word in ["news", "weather", "latest", "current"]):
-        return ["realtime", query]
-        
-    # Handle command queries
-    if any(cmd in query for cmd in ["open", "close", "play", "system", "content", "google search", "youtube search"]):
-        return ["command", query]
-        
-    # Handle exit
-    if any(word in query for word in ["bye", "goodbye", "exit", "quit"]):
-        return ["exit"]
-        
-    # General queries
-    return ["general", query]
+    for part in parts:
+        part = part.strip()
+        if "generate" in part:
+            prompt = part[part.find("generate"):].strip()
+            commands.append(prompt)
+        elif "what is the time" in part:
+            commands.append("realtime time")
+        elif "open" in part or "close" in part:
+            commands.append(part)
+        else:
+            commands.append(f"general {part}")
+            
+    return commands
+
+def FirstLayerDMM(query: str) -> list:
+    query = query.lower()
+    commands = split_complex_query(query)
+    decisions = []
+    
+    for command in commands:
+        if command.startswith("generate"):
+            prompt = command.replace("generate", "", 1).strip()
+            decisions.append(["generate", prompt])
+        elif command.startswith("realtime"):
+            decisions.append(["realtime", command])
+        elif command.startswith("open") or command.startswith("close"):
+            decisions.append(["command", command])
+        else:
+            decisions.append(["general", command])
+            
+    return decisions
 
 def MainExecution():
     TaskExecution = False
@@ -206,54 +219,46 @@ def MainExecution():
     Query = SpeechRecognition()
     ShowTextToScreen(f"{Username} : {Query}")
     
-    # Get decision from Model
-    decision = FirstLayerDMM(Query)
-    if not decision:
-        return False
-        
-    decision_type = decision[0]
+    # Get decisions from Model
+    decisions = FirstLayerDMM(Query)
     
-    # Handle decisions
-    if decision_type == "generate":
-        try:
-            prompt = decision[1]
-            SetAssistantStatus("Generating image...")
-            success = generate_images_and_open(prompt)
+    # Process each decision
+    for decision in decisions:
+        decision_type = decision[0]
+        
+        if decision_type == "generate":
+            try:
+                prompt = decision[1]
+                SetAssistantStatus("Generating image...")
+                success = generate_images_and_open(prompt)
+                TaskExecution = success
+            except Exception as e:
+                logger.error(f"Image generation failed: {e}")
+                
+        elif decision_type == "realtime":
+            Answer = RealtimeSearchEngine(QueryModifier(decision[1]))
+            ShowTextToScreen(f"{Assistantname}:{Answer}")
+            SetAssistantStatus("Answering...")
+            TextToSpeech(Answer)
+            TaskExecution = True
             
-            if success:
-                SetAssistantStatus("Image generated successfully")
-                return True
-            else:
-                SetAssistantStatus("Image generation failed")
-                return False
-        except Exception as e:
-            logger.error(f"Image generation failed: {e}")
-            return False
+        elif decision_type == "command":
+            run(Automation([decision[1]]))
+            TaskExecution = True
             
-    elif decision_type == "realtime":
-        TaskExecution = True
-        Answer = RealtimeSearchEngine(QueryModifier(decision[1]))
-        ShowTextToScreen(f"{Assistantname}:{Answer}")
-        SetAssistantStatus("Answering...")
-        TextToSpeech(Answer)
-        
-    elif decision_type == "command":
-        TaskExecution = True
-        run(Automation([decision[1]]))
-        
-    elif decision_type == "exit":
-        Answer = "Goodbye! Have a great day!"
-        ShowTextToScreen(f"{Assistantname}:{Answer}")
-        TextToSpeech(Answer)
-        sys.exit(0)
-        
-    else:  # general
-        TaskExecution = True
-        Answer = ChatBot(QueryModifier(decision[1]))
-        ShowTextToScreen(f"{Assistantname}:{Answer}")
-        SetAssistantStatus("Answering...")
-        TextToSpeech(Answer)
-        
+        elif decision_type == "exit":
+            Answer = "Goodbye! Have a great day!"
+            ShowTextToScreen(f"{Assistantname}:{Answer}")
+            TextToSpeech(Answer)
+            sys.exit(0)
+            
+        else:  # general
+            Answer = ChatBot(QueryModifier(decision[1]))
+            ShowTextToScreen(f"{Assistantname}:{Answer}")
+            SetAssistantStatus("Answering...")
+            TextToSpeech(Answer)
+            TaskExecution = True
+            
     return TaskExecution
 
 def firstThread():
