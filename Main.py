@@ -30,7 +30,12 @@ from groq import Groq
 from huggingface_hub import HfApi
 from dotenv import load_dotenv
 import re
+import asyncio
 from Backend.ImageGeneration import generate_images_and_open
+
+# Add new imports
+import nest_asyncio
+nest_asyncio.apply()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -92,6 +97,8 @@ def InitialExecution():
     ShowChatsOnGUI()
     
 InitialExecution()
+
+
 
 def test_api_connections():
     load_dotenv()
@@ -176,90 +183,245 @@ def classify_query(query: str) -> str:
     return 'general'  # Default case
 
 def split_complex_query(query: str) -> list:
-    """Split query with multiple commands"""
+    """Split multi-part queries and detect command types"""
     commands = []
     parts = query.split(" and ")
     
+    automation_keywords = {
+        "open": "command",
+        "close": "command",
+        "play": "command",
+        "start": "command",
+        "launch": "command"
+    }
+    
     for part in parts:
-        part = part.strip()
-        if "generate" in part:
-            prompt = part[part.find("generate"):].strip()
-            commands.append(prompt)
-        elif "what is the time" in part:
-            commands.append("realtime time")
-        elif "open" in part or "close" in part:
-            commands.append(part)
+        part = part.strip().lower()
+        
+        # Check for automation commands first
+        for keyword, cmd_type in automation_keywords.items():
+            if part.startswith(keyword):
+                commands.append([cmd_type, part])
+                break
         else:
-            commands.append(f"general {part}")
-            
+            # If no automation command found, check other types
+            if part.startswith("generate"):
+                commands.append(["generate", part])
+            elif any(word in part for word in ["time", "weather", "news"]):
+                commands.append(["realtime", part])
+            elif "tell me" in part or "what is" in part:
+                commands.append(["general", part])
+            else:
+                commands.append(["general", part])
+    
     return commands
 
-def FirstLayerDMM(query: str) -> list:
-    query = query.lower()
-    commands = split_complex_query(query)
-    decisions = []
+def detect_multiple_commands(query: str) -> list:
+    """Advanced command detection using NLP patterns"""
+    commands = []
     
-    for command in commands:
-        if command.startswith("generate"):
-            prompt = command.replace("generate", "", 1).strip()
-            decisions.append(["generate", prompt])
-        elif command.startswith("realtime"):
-            decisions.append(["realtime", command])
-        elif command.startswith("open") or command.startswith("close"):
-            decisions.append(["command", command])
+    # Command patterns with intent classification
+    patterns = {
+        'generate': [
+            r'(generate|create|make|draw)\s+(a|an)?\s*(\w+(?:\s+\w+)*)',
+            r'(image|picture|artwork)\s+of\s+(\w+(?:\s+\w+)*)'
+        ],
+        'realtime': [
+            r'(weather|news|time|updates?)\s+(\w+(?:\s+\w+)*)',
+            r'(what|how)\s+is\s+(weather|time|stock|price)'
+        ],
+        'command': [
+            r'(open|close|launch|start)\s+(\w+(?:\s+\w+)*)',
+            r'(play|pause|stop)\s+(\w+(?:\s+\w+)*)'
+        ],
+        'system': [
+            r'(volume|brightness)\s+(up|down|mute|unmute)',
+            r'(turn|switch)\s+(on|off)\s+(\w+(?:\s+\w+)*)'
+        ],
+        'general': [
+            r'(tell|explain|what|how)\s+(about|is|to)\s+(\w+(?:\s+\w+)*)',
+            r'(search|find|look)\s+(for)?\s+(\w+(?:\s+\w+)*)'
+        ]
+    }
+    
+    query = query.lower().strip()
+    for cmd_type, pattern_list in patterns.items():
+        for pattern in pattern_list:
+            matches = re.finditer(pattern, query)
+            for match in matches:
+                commands.append([cmd_type, match.group()])
+    
+    return commands
+
+def extract_commands(query: str) -> tuple[list, str]:
+    """Extract automation and generation commands, return remaining text"""
+    commands = []
+    remaining_text = query.lower()
+    
+    # Command extraction patterns
+    patterns = {
+        'automation': r'(open|close|play|launch|start)\s+(\w+(?:\s+\w+)*)',
+        'generate': r'(generate|create|make|draw)\s+(a|an)?\s*(\w+(?:\s+\w+)*)'
+    }
+    
+    # Extract automation commands
+    auto_matches = re.finditer(patterns['automation'], remaining_text)
+    for match in auto_matches:
+        commands.append(["command", match.group()])
+        remaining_text = remaining_text.replace(match.group(), "")
+    
+    # Extract generation commands
+    gen_matches = re.finditer(patterns['generate'], remaining_text)
+    for match in gen_matches:
+        commands.append(["generate", match.group()])
+        remaining_text = remaining_text.replace(match.group(), "")
+    
+    # Clean remaining text
+    remaining_text = " ".join(remaining_text.split())
+    return commands, remaining_text
+
+async def execute_parallel_tasks(decisions):
+    """Enhanced parallel task execution with command separation"""
+    automation_tasks = []
+    generation_tasks = []
+    other_tasks = []
+    
+    # Separate commands by type
+    for decision_type, content in decisions:
+        if decision_type == "command":
+            automation_tasks.append((decision_type, content))
+        elif decision_type == "generate":
+            generation_tasks.append((decision_type, content))
         else:
-            decisions.append(["general", command])
-            
-    return decisions
+            other_tasks.append((decision_type, content))
+    
+    try:
+        # Process generation and other tasks in parallel
+        parallel_tasks = []
+        if generation_tasks:
+            parallel_tasks.extend([process_decision(dtype, content) 
+                                 for dtype, content in generation_tasks])
+        if other_tasks:
+            parallel_tasks.extend([process_decision(dtype, content) 
+                                 for dtype, content in other_tasks])
+        
+        if parallel_tasks:
+            await asyncio.gather(*parallel_tasks)
+        
+        # Process automation tasks sequentially
+        for dtype, content in automation_tasks:
+            await process_decision(dtype, content)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Task execution error: {e}")
+        return False
+
+def FirstLayerDMM(query: str) -> list:
+    """Enhanced decision making with command separation"""
+    commands, remaining_text = extract_commands(query)
+    
+    # Process remaining text if any
+    if remaining_text:
+        if any(word in remaining_text for word in ["weather", "news", "time"]):
+            commands.append(["realtime", remaining_text])
+        else:
+            commands.append(["general", remaining_text])
+    
+    return commands
+
+async def process_decision(decision_type: str, content: str) -> bool:
+    """Enhanced process_decision with parallel support"""
+    try:
+        match decision_type:
+            case "generate":
+                SetAssistantStatus(f"Generating image: {content}")
+                return await asyncio.to_thread(generate_images_and_open, content)
+                
+            case "realtime":
+                SetAssistantStatus("Getting realtime info...")
+                answer = await asyncio.to_thread(RealtimeSearchEngine, QueryModifier(content))
+                ShowTextToScreen(f"{Assistantname}:{answer}")
+                await asyncio.to_thread(TextToSpeech, answer)
+                return True
+                
+            case "command" | "system":
+                SetAssistantStatus(f"Executing {decision_type}: {content}")
+                return await Automation([content])
+                
+            case _:  # general or chat
+                SetAssistantStatus("Processing query...")
+                answer = await asyncio.to_thread(ChatBot, QueryModifier(content))
+                ShowTextToScreen(f"{Assistantname}:{answer}")
+                await asyncio.to_thread(TextToSpeech, answer)
+                return True
+                
+    except Exception as e:
+        logger.error(f"Error processing {decision_type}: {e}")
+        return False
+
+# Add async event loop management
+async def execute_tasks(decisions):
+    """Execute multiple tasks in parallel with priority handling"""
+    # Group tasks by priority
+    high_priority = []    # generate, realtime
+    medium_priority = []  # general, chat
+    low_priority = []     # command, system
+    
+    for decision_type, content in decisions:
+        if decision_type in ["generate", "realtime"]:
+            high_priority.append((decision_type, content))
+        elif decision_type in ["general", "chat"]:
+            medium_priority.append((decision_type, content))
+        else:
+            low_priority.append((decision_type, content))
+    
+    try:
+        # Execute high priority tasks in parallel
+        if high_priority:
+            tasks = [process_decision(dtype, content) for dtype, content in high_priority]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Execute medium priority tasks in parallel
+        if medium_priority:
+            tasks = [process_decision(dtype, content) for dtype, content in medium_priority]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Execute low priority tasks sequentially
+        for dtype, content in low_priority:
+            await process_decision(dtype, content)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Task execution error: {e}")
+        return False
+
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 def MainExecution():
-    TaskExecution = False
-    
-    SetAssistantStatus("Listening...")
-    Query = SpeechRecognition()
-    ShowTextToScreen(f"{Username} : {Query}")
-    
-    # Get decisions from Model
-    decisions = FirstLayerDMM(Query)
-    
-    # Process each decision
-    for decision in decisions:
-        decision_type = decision[0]
+    try:
+        SetAssistantStatus("Listening...")
+        Query = SpeechRecognition()
+        ShowTextToScreen(f"{Username} : {Query}")
         
-        if decision_type == "generate":
-            try:
-                prompt = decision[1]
-                SetAssistantStatus("Generating image...")
-                success = generate_images_and_open(prompt)
-                TaskExecution = success
-            except Exception as e:
-                logger.error(f"Image generation failed: {e}")
-                
-        elif decision_type == "realtime":
-            Answer = RealtimeSearchEngine(QueryModifier(decision[1]))
-            ShowTextToScreen(f"{Assistantname}:{Answer}")
-            SetAssistantStatus("Answering...")
-            TextToSpeech(Answer)
-            TaskExecution = True
-            
-        elif decision_type == "command":
-            run(Automation([decision[1]]))
-            TaskExecution = True
-            
-        elif decision_type == "exit":
-            Answer = "Goodbye! Have a great day!"
-            ShowTextToScreen(f"{Assistantname}:{Answer}")
-            TextToSpeech(Answer)
-            sys.exit(0)
-            
-        else:  # general
-            Answer = ChatBot(QueryModifier(decision[1]))
-            ShowTextToScreen(f"{Assistantname}:{Answer}")
-            SetAssistantStatus("Answering...")
-            TextToSpeech(Answer)
-            TaskExecution = True
-            
-    return TaskExecution
+        decisions = FirstLayerDMM(Query)
+        success = run_async(execute_parallel_tasks(decisions))
+        
+        if success:
+            SetAssistantStatus("Tasks completed")
+        return success
+        
+    except Exception as e:
+        logger.error(f"MainExecution error: {e}")
+        SetAssistantStatus("Error occurred")
+        return False
 
 def firstThread():
     while True:
