@@ -240,6 +240,10 @@ import time
 from datetime import datetime
 from functools import lru_cache
 from typing import Dict, Callable, List, Optional, Tuple
+from difflib import get_close_matches
+from fuzzywuzzy import fuzz
+import asyncio.queues
+import concurrent.futures
 
 import keyboard
 import requests
@@ -285,6 +289,28 @@ class AutomationManager:
             'close': ['and', ',', '&', 'also', 'plus'],
             'minimize': ['and', ',', '&', 'also', 'plus']
         }
+        
+        # Command correction dictionaries
+        self.command_aliases = {
+            'start': 'open',
+            'launch': 'open',
+            'exit': 'close',
+            'quit': 'close',
+            'hide': 'minimize',
+            'minimise': 'minimize',
+            'run': 'open'
+        }
+        
+        # Common app name corrections
+        self.app_corrections = {
+            'crome': 'chrome',
+            'firefix': 'firefox',
+            'notpad': 'notepad',
+            'excell': 'excel',
+            'word': 'winword'
+        }
+        
+        self.feedback_enabled = False
         
     def speak(self, message: str):
         """Provide voice feedback"""
@@ -372,74 +398,92 @@ class AutomationManager:
         })
 
     def parse_complex_command(self, command: str) -> List[Tuple[str, str]]:
-        """Parse complex commands with multiple actions and apps"""
+        """Enhanced parser for complex commands"""
         all_commands = []
         current_action = None
+        apps = []
         
-        # First split by different actions
-        action_parts = []
         words = command.lower().split()
-        temp_part = []
-        
-        for word in words:
+        i = 0
+        while i < len(words):
+            word = words[i]
+            
+            # Detect action words
             if word in ['open', 'close', 'minimize']:
-                if temp_part:
-                    action_parts.append(' '.join(temp_part))
-                    temp_part = []
+                # Process previous action if exists
+                if current_action and apps:
+                    for app in apps:
+                        all_commands.append((current_action, app))
                 current_action = word
-                temp_part.append(word)
-            elif word == 'and':
-                if temp_part:
-                    action_parts.append(' '.join(temp_part))
-                    temp_part = [current_action] if current_action else []
-            else:
-                temp_part.append(word)
-                
-        if temp_part:
-            action_parts.append(' '.join(temp_part))
+                apps = []
+            # Collect app names
+            elif word not in ['and', '&', ',']:
+                if current_action:
+                    apps.append(word)
+            i += 1
         
-        # Process each action part
-        for part in action_parts:
-            words = part.split()
-            if words[0] in ['open', 'close', 'minimize']:
-                current_action = words[0]
-                apps = ' '.join(words[1:])
-                # Split multiple apps
-                for app in [a.strip() for a in apps.split('and') if a.strip()]:
-                    all_commands.append((current_action, app))
-                    
+        # Process final action
+        if current_action and apps:
+            for app in apps:
+                all_commands.append((current_action, app))
+        
         return all_commands
 
+    def correct_command(self, command: str) -> str:
+        """Correct common command mistakes"""
+        words = command.lower().split()
+        corrected = []
+        
+        for word in words:
+            # Check command aliases
+            if word in self.command_aliases:
+                corrected.append(self.command_aliases[word])
+            # Check app corrections
+            elif word in self.app_corrections:
+                corrected.append(self.app_corrections[word])
+            # Fuzzy match for unknown words
+            else:
+                possible_commands = get_close_matches(word, 
+                    list(self.command_registry.keys()) + 
+                    list(self.app_corrections.keys()), n=1, cutoff=0.7)
+                if possible_commands:
+                    corrected.append(possible_commands[0])
+                else:
+                    corrected.append(word)
+        
+        return ' '.join(corrected)
+
     async def execute_command(self, command: str) -> Tuple[bool, str]:
-        """Enhanced execute_command for multiple actions"""
-        commands = self.parse_complex_command(command)
-        results = []
-        
-        # Group commands by action type
-        action_groups = {
-            'open': [],
-            'close': [],
-            'minimize': []
-        }
-        
-        for action, app in commands:
-            action_groups[action].append(app)
-        
-        # Execute each group
-        for action, apps in action_groups.items():
-            if apps:
+        """Sequential command execution"""
+        try:
+            # Correct command first
+            corrected = self.correct_command(command)
+            commands = self.parse_complex_command(corrected)
+            
+            if not commands:
+                return False, "No valid commands found"
+            
+            results = []
+            
+            # Execute commands sequentially
+            for action, app in commands:
                 handler = self.command_registry.get(action)
                 if handler:
-                    for app in apps:
-                        try:
-                            success = await handler(app)
-                            self._log_command(f"{action} {app}", success)
-                            results.append(success)
-                        except Exception as e:
-                            self.logger.error(f"Error {action} {app}: {e}")
-                            results.append(False)
-        
-        return all(results), ""
+                    try:
+                        # Wait for each command to complete
+                        await asyncio.sleep(0.5)  # Small delay between commands
+                        success = await handler(app)
+                        self._log_command(f"{action} {app}", success)
+                        results.append(success)
+                    except Exception as e:
+                        self.logger.error(f"Error {action} {app}: {e}")
+                        results.append(False)
+            
+            return all(results), ""
+            
+        except Exception as e:
+            self.logger.error(f"Command execution error: {e}")
+            return False, str(e)
 
     # Individual method implementations
     def open_app(self, app: str) -> bool:
@@ -451,70 +495,64 @@ class AutomationManager:
             return self.fallback_to_web(app)
 
     def close_app(self, app: str) -> bool:
-        """Enhanced close_app with verification"""
         try:
-            # Try multiple close attempts
-            max_attempts = 3
-            for attempt in range(max_attempts):
-                try:
-                    # Close using AppOpener
-                    close(app, match_closest=True, output=True, throw_error=True)
-                    time.sleep(0.5)  # Wait for closure
-                    
-                    # Verify closure using win32gui
-                    import win32gui
-                    def check_window(hwnd, app_name):
-                        if win32gui.IsWindowVisible(hwnd):
-                            title = win32gui.GetWindowText(hwnd).lower()
-                            return app_name.lower() in title
-                        return False
-                    
-                    # Check if app is still running
-                    found = False
-                    def enum_windows(hwnd, result):
-                        nonlocal found
-                        if check_window(hwnd, app):
-                            found = True
-                    win32gui.EnumWindows(enum_windows, None)
-                    
-                    if not found:
-                        self.logger.info(f"Successfully closed {app}")
-                        return True
-                        
-                    if attempt < max_attempts - 1:
-                        time.sleep(1)  # Wait before retry
-                        
-                except Exception as e:
-                    self.logger.error(f"Close attempt {attempt + 1} failed: {e}")
-                    if attempt < max_attempts - 1:
-                        continue
-                        
-            # Alternative close method using taskkill
-            try:
-                subprocess.run(['taskkill', '/F', '/IM', f'{app}.exe'], 
+            import win32gui
+            import win32process
+            import win32api
+            import win32con
+            
+            def close_window(hwnd, ctx):
+                if win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd).lower()
+                    if ctx['app'].lower() in title:
+                        try:
+                            # Send close message instead of force kill
+                            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                        except:
+                            pass
+            
+            context = {'app': app}
+            win32gui.EnumWindows(close_window, context)
+            time.sleep(1)  # Wait for graceful close
+            
+            # Only use taskkill as last resort
+            if app.lower().endswith('.exe'):
+                subprocess.run(['taskkill', '/IM', app], 
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE)
-                return True
-            except Exception as e:
-                self.logger.error(f"Taskkill failed: {e}")
-                
-            return False
+            else:
+                subprocess.run(['taskkill', '/IM', f'{app}.exe'],
+                             stdout=subprocess.PIPE, 
+                             stderr=subprocess.PIPE)
+            return True
             
         except Exception as e:
-            self.logger.error(f"App close error: {e}")
+            self.logger.error(f"Close error: {e}")
             return False
 
     def minimize_app(self, app: str) -> bool:
         try:
-            # Using Windows API to minimize window
             import win32gui
-            def minimize_window(hwnd, wildcard):
-                if win32gui.IsWindowVisible(hwnd):
-                    if wildcard.lower() in win32gui.GetWindowText(hwnd).lower():
-                        win32gui.ShowWindow(hwnd, 6)  # SW_MINIMIze
+            import win32con
+            import win32com.client
             
-            win32gui.EnumWindows(lambda hwnd, _: minimize_window(hwnd, app), None)
-            return True
+            def minimize_window(hwnd, ctx):
+                if win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd).lower()
+                    if ctx['app'].lower() in title:
+                        try:
+                            # Use ShowWindow instead of direct minimize
+                            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                        except Exception:
+                            pass
+            try:
+                context = {'app': app}
+                win32gui.EnumWindows(minimize_window, context)
+                return True
+            finally:
+                # Cleanup COM objects
+                shell = win32com.client.Dispatch("WScript.Shell")
+                shell = None
         except Exception as e:
             self.logger.error(f"Minimize error: {e}")
             return False
@@ -574,38 +612,35 @@ class AutomationManager:
         return any(command.lower().startswith(keyword) for keyword in self.automation_keywords)
 
 async def Automation(commands: List[str]) -> Tuple[bool, List[str]]:
-    """Enhanced automation for complex commands"""
+    """Sequential command processing"""
     manager = AutomationManager()
     results = []
     feedback = []
     
     for command in commands:
-        # Handle complex command
-        if any(keyword in command.lower() for keyword in ['and', ',', '&']):
+        try:
+            # Process one command at a time
             success, msg = await manager.execute_command(command)
             results.append(success)
             feedback.append(msg)
-        # Handle simple command
-        else:
-            success, msg = await manager.execute_command(command)
-            results.append(success)
-            feedback.append(msg)
+            await asyncio.sleep(1)  # Wait between commands
+            
+        except Exception as e:
+            results.append(False)
+            feedback.append(str(e))
     
     return all(results), feedback
 
-# Test function
 if __name__ == "__main__":
     async def test():
         test_commands = [
-            "open chrome and firefox and whatsapp",
-            "close notepad and word and minimize excel",
-            "open spotify and close vlc and minimize chrome"
+            "open whatsapp and instagram",  # First group
+            "close file explorer"           # Second group
         ]
         
         success, feedback = await Automation(test_commands)
-        print(f"Overall success: {success}")
+        print(f"Success: {success}")
         for cmd, msg in zip(test_commands, feedback):
             print(f"{cmd}: {msg}")
     
     asyncio.run(test())
-
